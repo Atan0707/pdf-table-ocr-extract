@@ -4,6 +4,8 @@ import base64
 import csv
 import json
 import re
+import sys
+from datetime import datetime
 from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
 from io import BytesIO
@@ -14,56 +16,212 @@ load_dotenv()
 # PDF file path
 pdf_path = "pdf/Perangkaan-Agromakanan-Malaysia-2024.pdf"
 
-# Extract page 3 from PDF
-print("Extracting page 17 from PDF...")
+# Page range to process (17 to 30 inclusive)
+start_page = 17
+end_page = 30
+
+# CSV filename
+csv_filename = "ocr_output_pages_17-30.csv"
+
+# Setup logging to timestamped log file
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"log_{timestamp}.txt"
+log_file = open(log_filename, 'w', encoding='utf-8')
+
+# Save original print function
+_original_print = print
+
+def log_print(*args, **kwargs):
+    """Print to both console and log file"""
+    # Use original print for console output
+    _original_print(*args, **kwargs)
+    # Write to log file
+    message = ' '.join(str(arg) for arg in args)
+    log_file.write(message + '\n')
+    log_file.flush()
+
+# Redirect print to log_print
+print = log_print
+
+log_print(f"Log file created: {log_filename}")
+log_print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+log_print("="*60)
+
+# Load environment variables and initialize client
+api_key = os.getenv("MISTRAL_API_KEY", "")
+if not api_key:
+    log_print("Error: MISTRAL_API_KEY environment variable is not set")
+    log_file.close()
+    exit(1)
+
 try:
     reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
     
-    if total_pages < 17:
-        print(f"Error: PDF only has {total_pages} page(s). Page 17 does not exist.")
+    if total_pages < start_page:
+        print(f"Error: PDF only has {total_pages} page(s). Page {start_page} does not exist.")
         exit(1)
     
-    # Create a new PDF with only page 17 (0-indexed, so page 17 is index 16)
-    writer = PdfWriter()
-    writer.add_page(reader.pages[16])  # Page 17 is at index 16
+    # Adjust end_page if PDF has fewer pages
+    if total_pages < end_page:
+        print(f"Warning: PDF only has {total_pages} pages. Processing up to page {total_pages}.")
+        end_page = total_pages
     
-    # Write to bytes buffer
-    buffer = BytesIO()
-    writer.write(buffer)
-    buffer.seek(0)
+    print(f"Processing pages {start_page} to {end_page}...")
     
-    # Convert PDF page to base64
-    pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    
-except Exception as e:
-    print(f"Error extracting page from PDF: {e}")
-    exit(1)
-
-# Process with Mistral OCR
-print("Processing page 17 with OCR...")
-api_key = os.getenv("MISTRAL_API_KEY", "")
-if not api_key:
-    print("Error: MISTRAL_API_KEY environment variable is not set")
-    exit(1)
-
-try:
     client = Mistral(api_key=api_key)
     
-    ocr_response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": f"data:application/pdf;base64,{pdf_base64}",
-        },
-    )
+    # Open CSV file for writing (will overwrite if exists)
+    csvfile = open(csv_filename, 'w', newline='', encoding='utf-8')
+    writer = csv.writer(csvfile)
     
-    print("\n=== OCR Output for Page 17 ===")
-    print(ocr_response)
+    pages_processed = 0
+    tables_found = 0
     
-    # Convert OCR response to CSV
-    print("\n=== Converting OCR output to CSV ===")
-    csv_filename = "ocr_output_page_17.csv"
+    def clean_latex_math(cell_value):
+        """Clean LaTeX math formatting from cell values"""
+        if not isinstance(cell_value, str):
+            return cell_value
+        
+        # Remove LaTeX math delimiters ($ ... $)
+        cell_value = re.sub(r'\$([^$]*)\$', r'\1', cell_value)
+        
+        # Remove \mathbf{...} and other LaTeX commands
+        cell_value = re.sub(r'\\mathbf\{([^}]*)\}', r'\1', cell_value)
+        cell_value = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', cell_value)
+        cell_value = re.sub(r'\\[a-zA-Z]+', '', cell_value)
+        
+        # Remove HTML tags like <br>
+        cell_value = re.sub(r'<[^>]+>', ' ', cell_value)
+        
+        # Clean up spaces between digits (e.g., "2 0 2 0" -> "2020")
+        # But preserve spaces in text
+        def fix_spaced_digits(match):
+            digits = match.group(0)
+            # Remove spaces between digits
+            return re.sub(r'\s+', '', digits)
+        
+        # Match sequences of digits with spaces between them
+        cell_value = re.sub(r'\d(?:\s+\d)+', fix_spaced_digits, cell_value)
+        
+        # Clean up multiple spaces
+        cell_value = re.sub(r'\s+', ' ', cell_value)
+        
+        # Strip whitespace
+        cell_value = cell_value.strip()
+        
+        return cell_value
+    
+    def clean_row(row):
+        """Clean all cells in a row"""
+        return [clean_latex_math(cell) for cell in row]
+    
+    def remove_duplicate_rows(rows):
+        """Remove duplicate and repetitive rows from table data"""
+        if not rows:
+            return rows
+        
+        # Convert rows to tuples for comparison (after cleaning)
+        cleaned_rows = [tuple(clean_row(row)) for row in rows]
+        
+        # Track seen rows and result
+        seen = set()
+        result = []
+        duplicate_count = 0
+        
+        for i, row_tuple in enumerate(cleaned_rows):
+            # Skip empty rows
+            if not any(cell.strip() for cell in row_tuple):
+                continue
+            
+            # Check if this row is a duplicate
+            if row_tuple in seen:
+                duplicate_count += 1
+                continue
+            
+            # Add to seen and result
+            seen.add(row_tuple)
+            result.append(rows[i])  # Use original row (not cleaned tuple)
+        
+        # Calculate duplicate percentage
+        total_rows = len(rows)
+        if total_rows > 0:
+            duplicate_percentage = (duplicate_count / total_rows) * 100
+            if duplicate_percentage > 30:  # If more than 30% are duplicates
+                print(f"  Warning: {duplicate_percentage:.1f}% of rows were duplicates ({duplicate_count}/{total_rows})")
+        
+        return result
+    
+    def extract_table_title(markdown_text):
+        """Extract table title from markdown (text immediately before the first table row)"""
+        lines = markdown_text.split('\n')
+        title_lines = []
+        
+        # Find the index of the first table row
+        first_table_line_idx = None
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            if line_stripped.startswith('|'):
+                first_table_line_idx = i
+                break
+        
+        if first_table_line_idx is None:
+            return None
+        
+        # Only collect lines immediately before the table (up to 3 lines back, but skip empty lines)
+        # Look backwards from the first table line
+        collected_lines = []
+        for i in range(first_table_line_idx - 1, max(-1, first_table_line_idx - 4), -1):
+            line_stripped = lines[i].strip()
+            if line_stripped:
+                # Skip image references
+                if line_stripped.startswith('![') or line_stripped.startswith('img-'):
+                    continue
+                # Skip markdown headers (#)
+                if line_stripped.startswith('#'):
+                    continue
+                collected_lines.insert(0, line_stripped)
+        
+        # Filter out lines that don't look like table titles
+        # Keep lines that contain table-related keywords or are short (likely titles)
+        filtered_lines = []
+        for line in collected_lines:
+            line_stripped = line.strip()
+            line_lower = line_stripped.lower()
+            
+            # Skip very long lines (likely paragraph text, not titles)
+            if len(line_stripped) > 200:
+                continue
+            
+            # Keep if it contains table-related keywords (JADUAL, Table, Figure)
+            if any(keyword in line_lower for keyword in ['jadual', 'table', 'figure']):
+                # For "Figure X:" patterns, extract just the description part
+                if line_lower.startswith('figure'):
+                    # Extract text after "Figure X:"
+                    parts = line_stripped.split(':', 1)
+                    if len(parts) > 1:
+                        filtered_lines.append(parts[1].strip())
+                    else:
+                        filtered_lines.append(line_stripped)
+                else:
+                    filtered_lines.append(line_stripped)
+            # Keep short lines (likely titles, not paragraph text)
+            elif len(line_stripped) < 200:
+                filtered_lines.append(line_stripped)
+        
+        # If we filtered everything out, use the last collected line (immediately before table)
+        if not filtered_lines and collected_lines:
+            # Use the last non-empty line immediately before the table
+            last_line = collected_lines[-1].strip()
+            if len(last_line) < 300:  # Only if it's reasonably short
+                filtered_lines = [last_line]
+        
+        if filtered_lines:
+            # Join title lines and clean LaTeX formatting
+            title = ' '.join(filtered_lines)
+            title = clean_latex_math(title)
+            return title
+        return None
     
     def parse_markdown_table(markdown_text):
         """Parse markdown table and return list of rows, handling multi-line cells"""
@@ -123,6 +281,18 @@ try:
             elif current_row_parts:
                 # This is a continuation line (part of a multi-line cell)
                 current_row_parts.append(line_stripped)
+                # Check if this continuation line ends with |, meaning the row is complete
+                if line_stripped.endswith('|'):
+                    row_text = ' '.join(current_row_parts).strip()
+                    if row_text.startswith('|') and row_text.endswith('|'):
+                        cells = [cell.strip() for cell in row_text[1:-1].split('|')]
+                        if cells and not cells[0]:
+                            cells = cells[1:]
+                        if cells and not cells[-1]:
+                            cells = cells[:-1]
+                        if cells:
+                            rows.append(cells)
+                    current_row_parts = []
         
         # Handle any remaining row
         if current_row_parts:
@@ -138,39 +308,24 @@ try:
         
         return rows
     
-    try:
-        # Extract markdown from OCR response pages
+    def extract_tables_from_ocr_response(ocr_response, page_num):
+        """Extract markdown tables from OCR response"""
         markdown_tables = []
-        
-        # Debug: Print response type and attributes
-        print(f"\n=== Debug: OCR Response Type ===")
-        print(f"Type: {type(ocr_response)}")
-        print(f"Has 'pages' attr: {hasattr(ocr_response, 'pages')}")
         
         # Check if ocr_response has pages attribute
         if hasattr(ocr_response, 'pages'):
-            print(f"Found 'pages' attribute, type: {type(ocr_response.pages)}")
-            print(f"Number of pages: {len(ocr_response.pages) if ocr_response.pages else 0}")
-            for idx, page in enumerate(ocr_response.pages):
-                print(f"Page {idx} type: {type(page)}")
-                print(f"Page {idx} has 'markdown' attr: {hasattr(page, 'markdown')}")
-                if hasattr(page, 'markdown'):
-                    markdown_content = page.markdown
-                    print(f"Page {idx} markdown length: {len(markdown_content) if markdown_content else 0}")
-                    if markdown_content:
-                        markdown_tables.append(markdown_content)
-                        print(f"Added markdown from page {idx}")
+            for page in ocr_response.pages:
+                if hasattr(page, 'markdown') and page.markdown:
+                    markdown_tables.append(page.markdown)
         elif hasattr(ocr_response, '__dict__'):
             ocr_dict = ocr_response.__dict__
-            print(f"Using __dict__, keys: {list(ocr_dict.keys())}")
             if 'pages' in ocr_dict:
-                for idx, page in enumerate(ocr_dict['pages']):
+                for page in ocr_dict['pages']:
                     if hasattr(page, 'markdown') and page.markdown:
                         markdown_tables.append(page.markdown)
                     elif isinstance(page, dict) and 'markdown' in page:
                         markdown_tables.append(page['markdown'])
         elif isinstance(ocr_response, dict):
-            print(f"OCR response is a dict, keys: {list(ocr_response.keys())}")
             if 'pages' in ocr_response:
                 for page in ocr_response['pages']:
                     if isinstance(page, dict) and 'markdown' in page:
@@ -178,121 +333,183 @@ try:
                     elif hasattr(page, 'markdown'):
                         markdown_tables.append(page.markdown)
         
-        print(f"\n=== Debug: Extracted {len(markdown_tables)} markdown table(s) ===")
+        return markdown_tables
+    
+    # Process each page
+    for page_num in range(start_page, end_page + 1):
+        print(f"\n{'='*60}")
+        print(f"Processing Page {page_num}...")
+        print(f"{'='*60}")
         
-        # Write CSV file
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
+        try:
+            # Extract page from PDF (0-indexed, so page_num - 1)
+            pdf_writer = PdfWriter()
+            pdf_writer.add_page(reader.pages[page_num - 1])
+            
+            # Write to bytes buffer
+            buffer = BytesIO()
+            pdf_writer.write(buffer)
+            buffer.seek(0)
+            
+            # Convert PDF page to base64
+            pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            # Process with Mistral OCR
+            print(f"Calling OCR API for page {page_num}...")
+            print(f"  Request details:")
+            print(f"    Model: mistral-ocr-latest")
+            print(f"    Document type: document_url")
+            print(f"    PDF size: {len(pdf_base64)} base64 characters")
+            
+            ocr_response = client.ocr.process(
+                model="mistral-ocr-latest",
+                document={
+                    "type": "document_url",
+                    "document_url": f"data:application/pdf;base64,{pdf_base64}",
+                },
+            )
+            
+            # Log OCR response
+            print(f"\n  OCR Response received:")
+            print(f"    Response type: {type(ocr_response)}")
+            if hasattr(ocr_response, 'model'):
+                print(f"    Model used: {ocr_response.model}")
+            if hasattr(ocr_response, 'usage_info'):
+                print(f"    Usage info: {ocr_response.usage_info}")
+            if hasattr(ocr_response, 'pages'):
+                print(f"    Number of pages in response: {len(ocr_response.pages)}")
+                for idx, page in enumerate(ocr_response.pages):
+                    print(f"    Page {idx}:")
+                    if hasattr(page, 'index'):
+                        print(f"      Index: {page.index}")
+                    if hasattr(page, 'markdown'):
+                        markdown_len = len(page.markdown) if page.markdown else 0
+                        print(f"      Markdown length: {markdown_len} characters")
+                        if page.markdown:
+                            # Log preview in console
+                            preview = page.markdown[:500].replace('\n', '\\n')
+                            print(f"      Markdown preview: {preview}...")
+                            # Write full markdown to log file
+                            log_file.write(f"\n      Full Markdown Content:\n")
+                            log_file.write(f"      {'='*60}\n")
+                            log_file.write(page.markdown)
+                            log_file.write(f"\n      {'='*60}\n")
+                            log_file.flush()
+                    if hasattr(page, 'dimensions'):
+                        print(f"      Dimensions: {page.dimensions}")
+            
+            # Log full response as string (for debugging)
+            print(f"\n  Full OCR Response (string representation):")
+            print(f"    {str(ocr_response)}")
+            print(f"    {'-'*60}")
+            
+            # Extract markdown tables from response
+            markdown_tables = extract_tables_from_ocr_response(ocr_response, page_num)
+            
+            print(f"\n  Extracted markdown tables: {len(markdown_tables)}")
+            for idx, markdown_content in enumerate(markdown_tables):
+                print(f"    Table {idx + 1}:")
+                print(f"      Length: {len(markdown_content)} characters")
+                # Log preview in console
+                preview = markdown_content[:300].replace(chr(10), '\\n').replace(chr(13), '')
+                print(f"      Preview (first 300 chars): {preview}...")
+                # Write full markdown content to log file
+                log_file.write(f"\n    Full Markdown Content for Table {idx + 1}:\n")
+                log_file.write(f"    {'='*60}\n")
+                log_file.write(markdown_content)
+                log_file.write(f"\n    {'='*60}\n")
+                log_file.flush()
             
             if markdown_tables:
-                # Process each markdown table
+                # Add page header
+                writer.writerow([])
+                writer.writerow([f"Page {page_num}"])
+                writer.writerow([])
+                
+                # Process each markdown table from this page
                 for table_idx, markdown_content in enumerate(markdown_tables):
-                    print(f"\nProcessing markdown table {table_idx + 1}...")
-                    print(f"Markdown preview (first 200 chars): {markdown_content[:200]}")
+                    print(f"  Processing table {table_idx + 1} from page {page_num}...")
+                    
+                    # Extract table title
+                    table_title = extract_table_title(markdown_content)
+                    if table_title:
+                        print(f"  Table title: {table_title[:100]}...")
                     
                     # Extract table from markdown
                     rows = parse_markdown_table(markdown_content)
-                    print(f"Parsed {len(rows)} rows from markdown")
+                    print(f"  Parsed {len(rows)} rows from markdown")
                     
                     if rows:
-                        # Write rows to CSV
-                        for row in rows:
-                            writer.writerow(row)
+                        # Remove duplicate/repetitive rows
+                        original_count = len(rows)
+                        rows = remove_duplicate_rows(rows)
+                        filtered_count = len(rows)
                         
-                        # Add empty row between tables if multiple tables
+                        if original_count != filtered_count:
+                            print(f"  Filtered out {original_count - filtered_count} duplicate rows ({filtered_count} unique rows remaining)")
+                        
+                        # Skip table if too many rows were filtered (likely bad OCR)
+                        if filtered_count == 0:
+                            print(f"  Warning: All rows were duplicates, skipping table")
+                            continue
+                        
+                        # Skip table if less than 2 rows remain (not useful)
+                        if filtered_count < 2:
+                            print(f"  Warning: Only {filtered_count} row(s) remaining after filtering, skipping table")
+                            continue
+                        
+                        tables_found += 1
+                        
+                        # Write table title if available
+                        if table_title:
+                            writer.writerow([table_title])
+                            writer.writerow([])  # Empty row after title
+                        
+                        # Write rows to CSV (with LaTeX cleaning)
+                        for row in rows:
+                            cleaned_row = clean_row(row)
+                            writer.writerow(cleaned_row)
+                        
+                        # Add spacing between tables if multiple tables on same page
                         if table_idx < len(markdown_tables) - 1:
+                            # Add 2 empty rows for better spacing between tables
+                            writer.writerow([])
                             writer.writerow([])
                     else:
-                        print(f"Warning: No rows parsed from markdown table {table_idx + 1}")
+                        print(f"  Warning: No rows parsed from markdown table {table_idx + 1} on page {page_num}")
             else:
-                print("\nNo markdown tables found, trying fallback extraction...")
-                # Fallback: try to extract markdown from string representation
-                ocr_str = str(ocr_response)
-                print(f"OCR string length: {len(ocr_str)}")
-                
-                if '|' in ocr_str:
-                    print("Found '|' in string representation, attempting to parse...")
-                    # Extract markdown table from the string
-                    # Look for the markdown content between quotes or after markdown=
-                    # Try multiple patterns to find markdown content
-                    markdown_content = None
-                    
-                    # Pattern 1: markdown="content"
-                    markdown_match = re.search(r'markdown="([^"]+)"', ocr_str, re.DOTALL)
-                    if markdown_match:
-                        markdown_content = markdown_match.group(1)
-                    else:
-                        # Pattern 2: markdown='content'
-                        markdown_match = re.search(r"markdown='([^']+)'", ocr_str, re.DOTALL)
-                        if markdown_match:
-                            markdown_content = markdown_match.group(1)
-                    
-                    if markdown_content:
-                        # Handle escaped newlines and other escape sequences
-                        markdown_content = markdown_content.replace('\\n', '\n').replace('\\t', '\t')
-                        print(f"Found markdown in string, length: {len(markdown_content)}")
-                        print(f"First 300 chars: {markdown_content[:300]}")
-                        rows = parse_markdown_table(markdown_content)
-                        if rows:
-                            for row in rows:
-                                writer.writerow(row)
-                        else:
-                            # Try parsing the full string
-                            lines = ocr_str.split('\n')
-                            rows = []
-                            for line in lines:
-                                if '|' in line and line.strip().startswith('|') and line.strip().endswith('|'):
-                                    if not all(c in '| -:' for c in line.replace(' ', '')):
-                                        cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                                        if cells:
-                                            rows.append(cells)
-                            if rows:
-                                for row in rows:
-                                    writer.writerow(row)
-                            else:
-                                writer.writerow(['OCR Markdown Content'])
-                                writer.writerow([ocr_str])
-                    else:
-                        # Try parsing the full string for table rows
-                        lines = ocr_str.split('\n')
-                        rows = []
-                        for line in lines:
-                            if '|' in line and line.strip().startswith('|') and line.strip().endswith('|'):
-                                if not all(c in '| -:' for c in line.replace(' ', '')):
-                                    cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                                    if cells:
-                                        rows.append(cells)
-                        if rows:
-                            print(f"Found {len(rows)} rows in string representation")
-                            for row in rows:
-                                writer.writerow(row)
-                        else:
-                            # Last resort: save as single column with full markdown
-                            writer.writerow(['OCR Markdown Content'])
-                            writer.writerow([ocr_str])
-                else:
-                    # Save raw response info
-                    writer.writerow(['OCR Response'])
-                    writer.writerow([str(ocr_response)])
-        
-        print(f"\nCSV file saved successfully: {csv_filename}")
-        
-    except Exception as csv_error:
-        print(f"Error converting to CSV: {csv_error}")
-        print("Attempting to save raw response as JSON...")
-        try:
-            json_filename = "ocr_output_page_17.json"
-            with open(json_filename, 'w', encoding='utf-8') as jsonfile:
-                if isinstance(ocr_response, dict):
-                    json.dump(ocr_response, jsonfile, indent=2, ensure_ascii=False, default=str)
-                else:
-                    json.dump(json.loads(json.dumps(ocr_response, default=str)), jsonfile, indent=2, ensure_ascii=False)
-            print(f"Raw response saved as JSON: {json_filename}")
-        except Exception as json_error:
-            print(f"Error saving JSON: {json_error}")
+                print(f"  No tables found on page {page_num}")
+            
+            pages_processed += 1
+            
+        except Exception as page_error:
+            print(f"Error processing page {page_num}: {page_error}")
+            # Add error marker to CSV
+            writer.writerow([])
+            writer.writerow([f"Page {page_num} - ERROR: {str(page_error)}"])
+            writer.writerow([])
+            continue
+    
+    # Close CSV file
+    csvfile.close()
+    
+    log_print(f"\n{'='*60}")
+    log_print(f"Processing Complete!")
+    log_print(f"Pages processed: {pages_processed}")
+    log_print(f"Tables found: {tables_found}")
+    log_print(f"CSV file saved: {csv_filename}")
+    log_print(f"Log file saved: {log_filename}")
+    log_print(f"{'='*60}")
+    
+    # Close log file
+    log_file.close()
     
 except Exception as e:
-    print(f"Error processing OCR: {e}")
-    print("\nNote: If you see an API format error, the document format might need adjustment.")
-    print("Check Mistral OCR API documentation for the correct format.")
+    log_print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
+    if 'csvfile' in locals():
+        csvfile.close()
+    if 'log_file' in locals():
+        log_file.close()
     raise
