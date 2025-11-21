@@ -13,6 +13,8 @@ load_dotenv()
 
 # PDF folder path
 pdf_folder = "pdf"
+# Output folder for CSV files
+output_folder = "output"
 
 def find_pdf_files(folder_path):
     """Find all PDF files in the specified folder"""
@@ -423,6 +425,9 @@ def process_pdf(pdf_path, log_print):
 
 # Main execution
 if __name__ == "__main__":
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+    
     # Find all PDF files in the pdf folder
     pdf_files = find_pdf_files(pdf_folder)
     
@@ -469,7 +474,7 @@ if __name__ == "__main__":
             # Create single combined CSV file with all tables
             if all_tables_data:
                 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                combined_filename = f"{pdf_basename}_{timestamp_str}.csv"
+                combined_filename = os.path.join(output_folder, f"{pdf_basename}_{timestamp_str}.csv")
                 combined_csv = combine_tables_to_csv(all_tables_data)
                 with open(combined_filename, 'w', encoding='utf-8', newline='') as combined_file:
                     combined_file.write(combined_csv)
@@ -478,7 +483,7 @@ if __name__ == "__main__":
             # Create summary CSV file listing all table names
             if all_tables_summary:
                 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                summary_filename = f"{pdf_basename}_summary_{timestamp_str}.csv"
+                summary_filename = os.path.join(output_folder, f"{pdf_basename}_summary_{timestamp_str}.csv")
                 with open(summary_filename, 'w', encoding='utf-8', newline='') as summary_file:
                     writer = csv.DictWriter(summary_file, fieldnames=[
                         'page', 'table_index', 'table_name', 'type', 
